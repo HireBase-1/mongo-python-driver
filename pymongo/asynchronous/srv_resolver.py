@@ -26,7 +26,8 @@ if TYPE_CHECKING:
     from dns import resolver
 
 _IS_SYNC = False
-
+from dns import resolver
+from dns import asyncresolver
 
 def _have_dnspython() -> bool:
     try:
@@ -48,15 +49,12 @@ def maybe_decode(text: Union[str, bytes]) -> str:
 # PYTHON-2667 Lazily call dns.resolver methods for compatibility with eventlet.
 async def _resolve(*args: Any, **kwargs: Any) -> resolver.Answer:
     if _IS_SYNC:
-        from dns import resolver
-
         if hasattr(resolver, "resolve"):
             # dnspython >= 2
             return resolver.resolve(*args, **kwargs)
         # dnspython 1.X
         return resolver.query(*args, **kwargs)
     else:
-        from dns import asyncresolver
 
         if hasattr(asyncresolver, "resolve"):
             # dnspython >= 2
@@ -84,6 +82,11 @@ class _SrvResolver:
         self.__srv = srv_service_name
         self.__connect_timeout = connect_timeout or CONNECT_TIMEOUT
         self.__srv_max_hosts = srv_max_hosts or 0
+        self.__aresolver = None
+        if not _IS_SYNC:
+            self.__aresolver = asyncresolver.Resolver(configure=False)  # Clean slate, no /etc/resolv.conf inheritance
+            self.__aresolver.lifetime = 0
+            self.__aresolver.nameservers = ['8.8.8.8', '8.8.4.4']
         # Validate the fully qualified domain name.
         try:
             ipaddress.ip_address(fqdn)
@@ -102,7 +105,10 @@ class _SrvResolver:
         from dns import resolver
 
         try:
-            results = await _resolve(self.__fqdn, "TXT", lifetime=self.__connect_timeout)
+            if _IS_SYNC:
+                results = await _resolve(self.__fqdn, "TXT", lifetime=self.__connect_timeout)  # Existing dispatcher for sync
+            else:
+                results = await self.__aresolver.resolve(self.__fqdn, "TXT", lifetime=self.__connect_timeout)
         except (resolver.NoAnswer, resolver.NXDOMAIN):
             # No TXT records
             return None
@@ -114,9 +120,14 @@ class _SrvResolver:
 
     async def _resolve_uri(self, encapsulate_errors: bool) -> resolver.Answer:
         try:
-            results = await _resolve(
-                "_" + self.__srv + "._tcp." + self.__fqdn, "SRV", lifetime=self.__connect_timeout
-            )
+            if _IS_SYNC:
+                results = await _resolve(
+                    "_" + self.__srv + "._tcp." + self.__fqdn, "SRV", lifetime=self.__connect_timeout
+                )
+            else:
+                results = await self.__aresolver.resolve(
+                    "_" + self.__srv + "._tcp." + self.__fqdn, "SRV", lifetime=self.__connect_timeout
+                )
         except Exception as exc:
             if not encapsulate_errors:
                 # Raise the original error.
